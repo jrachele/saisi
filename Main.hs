@@ -10,31 +10,26 @@ import Data.Char
 main :: IO ()
 main = undefined
 
-data Interpreter
-type Result = Maybe Double
 
--- Create the grammar
+-- Tokenizer
+-----------------------------------------------
 data Token
     = Number Double
     | Identifier String
-    | Operator
     | FnKeyword
     | FnOperator
     | Parenthesis Char
-    | Add
+    | Op Operator
+    deriving (Show, Eq)
+
+data Operator
+    = Add
     | Subtract
     | Multiply
     | Divide
     | Modulo
     | Equals
     deriving (Show, Eq)
-
--- Composite tokens that represent more complex syntax
--- data Composites
---     = FunctionCall Identifier Expression
---     | Assignment Identifier Expression
---     | Expression
-
 
 newtype Tokenizer a = Tokenizer {
     tokenize :: String -> Maybe (a, String)
@@ -60,7 +55,7 @@ instance Applicative Tokenizer where
                 (result, rest') <- normTokenizer rest
                 -- Return the result of applying that function to the value
                 Just (func result, rest')
-                
+
 -- Essentially lets us OR tokenizers to build them up
 instance Alternative Tokenizer where
     empty = Tokenizer (const Nothing)
@@ -70,16 +65,15 @@ instance Alternative Tokenizer where
         where tok input = (t1 input) <|> (t2 input)
 
 
-
--- Helper tokenizers
----------------------------------------------
+---- Helper tokenizers
+-----------------------------------------------
 -- Allows creating any arbitrary single character tokenizer
 charTokenizer :: Char -> Tokenizer Char
 charTokenizer c = Tokenizer firstChar
     where firstChar :: String -> Maybe (Char, String)
           firstChar (x:rest) = if c==x then Just (x, rest) else Nothing
           firstChar _ = Nothing
-        
+
 -- Allows creating any arbitrary string tokenizer (basically all of em)
 stringTokenizer :: String -> Tokenizer String
 stringTokenizer = sequenceA . map charTokenizer
@@ -88,17 +82,17 @@ stringTokenizer = sequenceA . map charTokenizer
 spanTokenizer :: (Char -> Bool) -> Tokenizer String
 spanTokenizer f = Tokenizer tok
             where tok string = let (satisfiesPredicate, rest) = span f string in
-                               Just (satisfiesPredicate, rest) 
+                               Just (satisfiesPredicate, rest)
 
 -- Whitespace tokenizer
 ws :: Tokenizer String
 ws = spanTokenizer isSpace
 
-notEmpty :: Tokenizer String -> Tokenizer String
+notEmpty :: Eq a => Tokenizer [a] -> Tokenizer [a]
 notEmpty (Tokenizer t) = Tokenizer tok
     where tok input = do
             (a, rest) <- t input
-            if a == "" then Nothing else Just (a, rest)
+            if a == [] then Nothing else Just (a, rest)
 ---------------------------------------------
 
 number :: Tokenizer Token
@@ -117,32 +111,136 @@ parenthesis :: Tokenizer Token
 parenthesis = fmap Parenthesis (charTokenizer '(' <|> charTokenizer ')')
 
 addOperator :: Tokenizer Token
-addOperator = fmap (const Add) (charTokenizer '+')
+addOperator = fmap (const (Op Add)) (charTokenizer '+')
 
 subtractOperator :: Tokenizer Token
-subtractOperator = fmap (const Subtract) (charTokenizer '-')
+subtractOperator = fmap (const (Op Subtract)) (charTokenizer '-')
 
 multiplyOperator :: Tokenizer Token
-multiplyOperator = fmap (const Multiply) (charTokenizer '*')
+multiplyOperator = fmap (const (Op Multiply)) (charTokenizer '*')
 
 divideOperator :: Tokenizer Token
-divideOperator = fmap (const Divide) (charTokenizer '/')
+divideOperator = fmap (const (Op Divide)) (charTokenizer '/')
 
 moduloOperator :: Tokenizer Token
-moduloOperator = fmap (const Modulo) (charTokenizer '%')
+moduloOperator = fmap (const (Op Modulo)) (charTokenizer '%')
 
 equalsOperator :: Tokenizer Token
-equalsOperator = fmap (const Equals) (charTokenizer '=')
+equalsOperator = fmap (const (Op Equals)) (charTokenizer '=')
 
 -- Main tokenizer that aggregates all smaller parsers together
 token :: Tokenizer Token
-token = fnKeyword        <|> fnOperator         <|>     number          <|> 
-        identifier       <|> parenthesis        <|>     addOperator     <|> 
-        subtractOperator <|> multiplyOperator   <|>     divideOperator  <|> 
+token = fnKeyword        <|> fnOperator         <|>     number          <|>
+        identifier       <|> parenthesis        <|>     addOperator     <|>
+        subtractOperator <|> multiplyOperator   <|>     divideOperator  <|>
         moduloOperator   <|> equalsOperator
 
 tokenizer :: Tokenizer [Token]
-tokenizer = (:) <$> token <*> many (ws *> token) <|> pure []
+tokenizer = ws *> ((:) <$> token <*> many (ws *> token) <|> pure [])
+
+-- Parser
+-----------------------------------------------
+data Tree
+    = NumLeaf Double
+    | IdLeaf String
+    | BinaryOp Operator Tree Tree
+    | Assign String Tree
+    | FunctionCall String Tree
+    | Empty
+    deriving (Show)
+
+
+newtype Parser a = Parser {
+    parse :: [Token] -> Maybe (a, [Token])
+}
+
+instance Functor Parser where
+    fmap f (Parser p) = Parser b
+      where b input = do
+                (t, rest) <- p input
+                Just (f t, rest)
+
+instance Applicative Parser where
+    pure x = Parser (\i -> Just (x, i))
+    (Parser p1) <*> (Parser p2) = Parser b
+      where b input = do
+                (func, rest) <- p1 input
+                (e, rest') <- p2 rest
+                Just (func e, rest')
+
+instance Alternative Parser where
+    empty = Parser (const Nothing)
+    (Parser p1) <|> (Parser p2) = Parser b
+      where b input = do
+                (p1 input) <|> (p2 input)
+
+
+parenthesisParser :: Char -> Parser Tree
+parenthesisParser c = Parser p
+                                                  -- We can use Empty here since we don't care
+  where p ((Parenthesis ch) : ts) = if c==ch then Just (Empty, ts) else Nothing
+        p _ = Nothing
+
+expressionParser :: Parser Tree
+expressionParser = Parser p
+  where p input = case factor of
+          Just (t, rest) -> Just (t, rest)
+          -- second case, expression operator expression
+          Nothing -> case firstExp of
+            Just (exp1, rest) -> case op of
+                -- might have an issue if Op is Equals
+                ((Op o) : rest') -> case secondExp of
+                  Just (exp2, rest'') -> Just ((BinaryOp o exp1 exp2), rest'')
+                  where secondExp = parse expressionParser rest'
+                _ -> Nothing
+              where op = rest
+            Nothing -> Nothing
+            where firstExp = parse expressionParser input
+          where factor = parse factorParser input
+
+factorParser :: Parser Tree
+factorParser = Parser p
+  where p ((Number n):ts) = Just (NumLeaf n, ts)
+        p ((Identifier i):ts) = Just (IdLeaf i, ts)
+        p input = case assignment of
+          -- First case - assignment
+          Just (t, rest) -> Just (t, rest)
+          -- Second case - expression within parenthesis
+          Nothing -> case expression of
+              Just (t, rest) -> Just (t, rest)
+              -- Third case - function call
+              Nothing -> case functionCall of
+                  Just (t, rest) -> Just (t, rest)
+                  Nothing -> Nothing
+                  where functionCall = parse functionCallParser input
+              where expression = let exp = parenthesisParser '(' *> expressionParser <* parenthesisParser ')'
+                                 in (parse exp input)
+          where assignment = parse assignmentParser input
+
+assignmentParser :: Parser Tree
+assignmentParser = Parser p
+  where p ((Identifier i) : (Op Equals) : rest) = do
+          (t, r) <- parse expressionParser rest
+          Just ((Assign i t), r)
+        p _ = Nothing
+
+functionCallParser :: Parser Tree
+functionCallParser = Parser p
+  where p ((Identifier i) : rest) = case x of
+           Just (e, r) -> Just (FunctionCall i e, r)
+           -- If there was no expression (which is possible)
+           Nothing -> Just (FunctionCall i Empty, rest)
+           where x = parse expressionParser rest
+        p _ = Nothing
+
+parseFromString :: String -> Maybe (Tree, [Token])
+parseFromString s = do
+    (tokens, _) <- tokenize tokenizer s
+    parse expressionParser tokens
+
+data Interpreter
+
+type Result = Maybe Double
 
 newInterpreter :: Interpreter
 newInterpreter = undefined
