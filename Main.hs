@@ -6,6 +6,7 @@ module Main where
 
 import Control.Applicative
 import Data.Char
+import Data.Fixed
 
 main :: IO ()
 main = undefined
@@ -17,7 +18,6 @@ data Token
     = Number Double
     | Identifier String
     | FnKeyword
-    | FnOperator
     | Parenthesis Char
     | Op Operator
     deriving (Show, Eq)
@@ -28,7 +28,8 @@ data Operator
     | Multiply
     | Divide
     | Modulo
-    | Equals
+    | Assignment
+    | Function
     deriving (Show, Eq)
 
 newtype Tokenizer a = Tokenizer {
@@ -95,6 +96,9 @@ notEmpty (Tokenizer t) = Tokenizer tok
             if a == [] then Nothing else Just (a, rest)
 ---------------------------------------------
 
+parenthesis :: Tokenizer Token
+parenthesis = fmap Parenthesis (charTokenizer '(' <|> charTokenizer ')')
+
 number :: Tokenizer Token
 number = fmap Number $ fmap read $ notEmpty $ spanTokenizer (\c -> c `elem` ['0'..'9'] ++ ['.'])
 
@@ -105,10 +109,7 @@ fnKeyword :: Tokenizer Token
 fnKeyword = fmap (const FnKeyword) (stringTokenizer "fn")
 
 fnOperator :: Tokenizer Token
-fnOperator = fmap (const FnOperator) (stringTokenizer "=>")
-
-parenthesis :: Tokenizer Token
-parenthesis = fmap Parenthesis (charTokenizer '(' <|> charTokenizer ')')
+fnOperator = fmap (const (Op Function)) (stringTokenizer "=>")
 
 addOperator :: Tokenizer Token
 addOperator = fmap (const (Op Add)) (charTokenizer '+')
@@ -126,7 +127,7 @@ moduloOperator :: Tokenizer Token
 moduloOperator = fmap (const (Op Modulo)) (charTokenizer '%')
 
 equalsOperator :: Tokenizer Token
-equalsOperator = fmap (const (Op Equals)) (charTokenizer '=')
+equalsOperator = fmap (const (Op Assignment)) (charTokenizer '=')
 
 -- Main tokenizer that aggregates all smaller parsers together
 token :: Tokenizer Token
@@ -174,76 +175,93 @@ instance Alternative Parser where
       where b input = do
                 (p1 input) <|> (p2 input)
 
+instance Monad Parser where
+    (Parser p) >>= f = Parser b
+      where b input = case p input of
+                      Nothing -> Nothing
+                      Just (x, r) -> parse (f x) r
 
-parenthesisParser :: Char -> Parser Tree
-parenthesisParser c = Parser p
-                                                  -- We can use Empty here since we don't care
-  where p ((Parenthesis ch) : ts) = if c==ch then Just (Empty, ts) else Nothing
+-- GRAMMAR:
+-- expr ::- term (+- expr)
+-- term :: factor (*/ term)
+-- factor :: (expr) | nat
+-- nat :: Number | Identifier
+
+expr :: Parser Tree
+expr = do
+       t <- term
+       do o <- additive_operator
+          e <- expr
+          return (BinaryOp o t e)
+          <|> return t
+
+term :: Parser Tree
+term = do
+       f <- factor
+       do o <- multiplicative_operator
+          t <- term
+          return (BinaryOp o f t)
+          <|> return f
+
+factor :: Parser Tree
+factor = (paren '(' *> expr <* paren ')') <|> nat
+
+nat :: Parser Tree
+nat = Parser p
+  where p ((Identifier i) : ts) = Just ((IdLeaf i), ts)
+        p ((Number n) : ts) = Just ((NumLeaf n), ts)
         p _ = Nothing
 
-expressionParser :: Parser Tree
-expressionParser = Parser p
-  where p input = case factor of
-          Just (t, rest) -> Just (t, rest)
-          -- second case, expression operator expression
-          Nothing -> case firstExp of
-            Just (exp1, rest) -> case op of
-                -- might have an issue if Op is Equals
-                ((Op o) : rest') -> case secondExp of
-                  Just (exp2, rest'') -> Just ((BinaryOp o exp1 exp2), rest'')
-                  where secondExp = parse expressionParser rest'
-                _ -> Nothing
-              where op = rest
-            Nothing -> Nothing
-            where firstExp = parse expressionParser input
-          where factor = parse factorParser input
-
-factorParser :: Parser Tree
-factorParser = Parser p
-  where p ((Number n):ts) = Just (NumLeaf n, ts)
-        p ((Identifier i):ts) = Just (IdLeaf i, ts)
-        p input = case assignment of
-          -- First case - assignment
-          Just (t, rest) -> Just (t, rest)
-          -- Second case - expression within parenthesis
-          Nothing -> case expression of
-              Just (t, rest) -> Just (t, rest)
-              -- Third case - function call
-              Nothing -> case functionCall of
-                  Just (t, rest) -> Just (t, rest)
-                  Nothing -> Nothing
-                  where functionCall = parse functionCallParser input
-              where expression = let exp = parenthesisParser '(' *> expressionParser <* parenthesisParser ')'
-                                 in (parse exp input)
-          where assignment = parse assignmentParser input
-
-assignmentParser :: Parser Tree
-assignmentParser = Parser p
-  where p ((Identifier i) : (Op Equals) : rest) = do
-          (t, r) <- parse expressionParser rest
-          Just ((Assign i t), r)
+additive_operator :: Parser Operator
+additive_operator = Parser p
+  where p ((Op o): ts) = case o of
+            Add -> Just (o, ts)
+            Subtract -> Just (o, ts)
+            _ -> Nothing
         p _ = Nothing
 
-functionCallParser :: Parser Tree
-functionCallParser = Parser p
-  where p ((Identifier i) : rest) = case x of
-           Just (e, r) -> Just (FunctionCall i e, r)
-           -- If there was no expression (which is possible)
-           Nothing -> Just (FunctionCall i Empty, rest)
-           where x = parse expressionParser rest
+multiplicative_operator :: Parser Operator
+multiplicative_operator = Parser p
+  where p ((Op o): ts) = case o of
+            Multiply -> Just (o, ts)
+            Divide -> Just (o, ts)
+            Modulo -> Just (o, ts)
+            _ -> Nothing
+        p _ = Nothing
+
+paren :: Char -> Parser Char
+paren c = Parser p
+  where p ((Parenthesis x) : ts) = if c==x then Just (x, ts) else Nothing
         p _ = Nothing
 
 parseFromString :: String -> Maybe (Tree, [Token])
 parseFromString s = do
-    (tokens, _) <- tokenize tokenizer s
-    parse expressionParser tokens
+                    (tokens, _) <- tokenize tokenizer s
+                    parse expr tokens
 
-data Interpreter
+
+eval :: Tree -> Result
+eval (NumLeaf n) = Just n
+eval (BinaryOp Add t1 t2) = (+) <$> eval t1 <*> eval t2
+eval (BinaryOp Subtract t1 t2) = (-) <$> eval t1 <*> eval t2
+eval (BinaryOp Multiply t1 t2) = (*) <$> eval t1 <*> eval t2
+eval (BinaryOp Divide t1 t2) = (/) <$> eval t1 <*> eval t2
+eval (BinaryOp Modulo t1 t2) = mod' <$> eval t1 <*> eval t2
+eval _ = Nothing
 
 type Result = Maybe Double
 
-newInterpreter :: Interpreter
-newInterpreter = undefined
+interpret :: String -> Result
+interpret s = do
+            (t, _) <- parseFromString s
+            eval t
 
-input :: String -> Interpreter -> Either String (Result, Interpreter)
-input _ _ = Left "Not implemented"
+--newtype Interpreter a = Interpreter {
+--  interpret :: Tree -> Result
+--}
+--
+--newInterpreter :: Interpreter
+--newInterpreter = undefined
+--
+--input :: String -> Interpreter -> Either String (Result, Interpreter)
+--input _ _ = Left "Not implemented"
