@@ -7,9 +7,7 @@ module Main where
 import Control.Applicative
 import Data.Char
 import Data.Fixed
-
-main :: IO ()
-main = undefined
+import qualified Data.Map as M
 
 
 -- Tokenizer
@@ -147,6 +145,7 @@ data Tree
     | BinaryOp Operator Tree Tree
     | Assign String Tree
     | FunctionCall String Tree
+    | FunctionDef String [String] Tree
     | Empty
     deriving (Show)
 
@@ -204,12 +203,24 @@ term = do
           <|> return f
 
 factor :: Parser Tree
-factor = (paren '(' *> expr <* paren ')') <|> nat
+factor = (paren '(' *> expr <* paren ')') <|>
+                  do
+                  i <- iden
+                  do assignment_operator
+                     e <- expr
+                     let (IdLeaf identifier) = i in
+                      return (Assign identifier e)
+                  <|> nat <|> iden
+
 
 nat :: Parser Tree
 nat = Parser p
+  where p ((Number n) : ts) = Just ((NumLeaf n), ts)
+        p _ = Nothing
+
+iden :: Parser Tree
+iden = Parser p
   where p ((Identifier i) : ts) = Just ((IdLeaf i), ts)
-        p ((Number n) : ts) = Just ((NumLeaf n), ts)
         p _ = Nothing
 
 additive_operator :: Parser Operator
@@ -229,6 +240,11 @@ multiplicative_operator = Parser p
             _ -> Nothing
         p _ = Nothing
 
+assignment_operator :: Parser Operator
+assignment_operator = Parser p
+  where p ((Op Assignment): ts) = Just (Assignment, ts)
+        p _ = Nothing
+
 paren :: Char -> Parser Char
 paren c = Parser p
   where p ((Parenthesis x) : ts) = if c==x then Just (x, ts) else Nothing
@@ -236,32 +252,77 @@ paren c = Parser p
 
 parseFromString :: String -> Maybe (Tree, [Token])
 parseFromString s = do
-                    (tokens, _) <- tokenize tokenizer s
+                    (tokens, []) <- tokenize tokenizer s
                     parse expr tokens
-
-
-eval :: Tree -> Result
-eval (NumLeaf n) = Just n
-eval (BinaryOp Add t1 t2) = (+) <$> eval t1 <*> eval t2
-eval (BinaryOp Subtract t1 t2) = (-) <$> eval t1 <*> eval t2
-eval (BinaryOp Multiply t1 t2) = (*) <$> eval t1 <*> eval t2
-eval (BinaryOp Divide t1 t2) = (/) <$> eval t1 <*> eval t2
-eval (BinaryOp Modulo t1 t2) = mod' <$> eval t1 <*> eval t2
-eval _ = Nothing
 
 type Result = Maybe Double
 
-interpret :: String -> Result
-interpret s = do
-            (t, _) <- parseFromString s
-            eval t
+-- M = Data.Map
+type StateTable = M.Map String Tree
 
---newtype Interpreter a = Interpreter {
---  interpret :: Tree -> Result
---}
---
+-- I'm aware of the State monad but nah
+eval :: Tree -> StateTable -> (Result, StateTable)
+eval (NumLeaf n) s = (Just n, s)
+eval (IdLeaf i) state = case M.lookup i state of
+                            Nothing -> (Nothing, state)
+                            -- Evaluate lazy content stored in table
+                            Just tree -> eval tree state
+eval (Assign identifier content) state = case (eval content state) of
+                            -- If the content is invalid, the state is unchanged and the user is notified
+                            (Nothing, _) -> (Nothing, state)
+                            -- Otherwise, it's possible the content itself modified the state, which we should
+                            -- take into account, then modify the state with the content's tree
+                            (res, state') -> (res, (M.insert identifier content state'))
+
+-- TODO: somehow refactor this so it looks nicer
+eval (BinaryOp Add t1 t2) s = let (res, s') = (eval t1 s) in
+                                let (res', s'') = (eval t2 s') in
+                                  ((+) <$> res <*> res', s'')
+
+eval (BinaryOp Subtract t1 t2) s = let (res, s') = (eval t1 s) in
+                                let (res', s'') = (eval t2 s') in
+                                  ((-) <$> res <*> res', s'')
+
+eval (BinaryOp Multiply t1 t2) s = let (res, s') = (eval t1 s) in
+                                let (res', s'') = (eval t2 s') in
+                                  ((*) <$> res <*> res', s'')
+
+eval (BinaryOp Divide t1 t2) s = let (res, s') = (eval t1 s) in
+                                let (res', s'') = (eval t2 s') in
+                                  ((/) <$> res <*> res', s'')
+
+eval (BinaryOp Modulo t1 t2) s = let (res, s') = (eval t1 s) in
+                                let (res', s'') = (eval t2 s') in
+                                  (mod' <$> res <*> res', s'')
+
+eval  _ s= (Nothing, s)
+
+
+interpret :: String -> StateTable -> (Result, StateTable)
+interpret string table = case parseTree of
+    Just (tree, []) -> eval tree table
+    _ -> (Nothing, table)
+  where parseTree = parseFromString string
+
+
 --newInterpreter :: Interpreter
 --newInterpreter = undefined
 --
 --input :: String -> Interpreter -> Either String (Result, Interpreter)
 --input _ _ = Left "Not implemented"
+
+main :: IO ()
+main = do
+       let st = M.empty
+       loop st
+
+loop :: StateTable -> IO ()
+loop st = do
+       input <- getLine
+       case (interpret input st) of
+          (Just d, newState) -> do
+                         putStrLn $ show d
+                         loop newState
+          (Nothing, newState) -> do
+                         putStrLn $ "Unable to interpret: " ++ input
+                         loop newState
