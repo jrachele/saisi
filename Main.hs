@@ -8,6 +8,7 @@ import Control.Applicative
 import Data.Char
 import Data.Fixed
 import qualified Data.Map as M
+import System.IO
 
 
 -- Tokenizer
@@ -135,7 +136,7 @@ token = fnKeyword        <|> fnOperator         <|>     number          <|>
         moduloOperator   <|> equalsOperator
 
 tokenizer :: Tokenizer [Token]
-tokenizer = ws *> ((:) <$> token <*> many (ws *> token) <|> pure [])
+tokenizer = ws *> ((:) <$> token <*> many (ws *> token) <|> pure []) <* ws
 
 -- Parser
 -----------------------------------------------
@@ -183,8 +184,10 @@ instance Monad Parser where
 -- GRAMMAR:
 -- expr ::- term (+- expr)
 -- term :: factor (*/ term)
--- factor :: (expr) | nat
--- nat :: Number | Identifier
+-- factor :: (expr) | assignment | num | iden
+-- assignment :: identifier = expr
+-- num :: Number
+-- iden :: Identifier
 
 expr :: Parser Tree
 expr = do
@@ -203,18 +206,18 @@ term = do
           <|> return f
 
 factor :: Parser Tree
-factor = (paren '(' *> expr <* paren ')') <|>
-                  do
-                  i <- iden
-                  do assignment_operator
-                     e <- expr
-                     let (IdLeaf identifier) = i in
-                      return (Assign identifier e)
-                  <|> nat <|> iden
+factor = (paren '(' *> expr <* paren ')') <|> assignment <|> num <|> iden
 
+assignment :: Parser Tree
+assignment = do
+             i <- iden
+             do assignment_operator
+                e <- expr
+                let (IdLeaf identifier) = i in
+                  return (Assign identifier e)
 
-nat :: Parser Tree
-nat = Parser p
+num :: Parser Tree
+num = Parser p
   where p ((Number n) : ts) = Just ((NumLeaf n), ts)
         p _ = Nothing
 
@@ -255,74 +258,128 @@ parseFromString s = do
                     (tokens, []) <- tokenize tokenizer s
                     parse expr tokens
 
-type Result = Maybe Double
+-- Interpreter
+-------------------------------------
 
 -- M = Data.Map
-type StateTable = M.Map String Tree
+type VarTable = M.Map String Tree
+-- Maybe store a function instead of [String] ?
+type FuncTable = M.Map String ([String], Tree)
+type Result = Maybe Double
 
--- I'm aware of the State monad but nah
-eval :: Tree -> StateTable -> (Result, StateTable)
-eval (NumLeaf n) s = (Just n, s)
-eval (IdLeaf i) state = case M.lookup i state of
-                            Nothing -> (Nothing, state)
-                            -- Evaluate lazy content stored in table
-                            Just tree -> eval tree state
-eval (Assign identifier content) state = case (eval content state) of
+-- For the sake of the kata, interpreter will be just two Maps
+type Interpreter = (VarTable, FuncTable)
+
+newInterpreter :: Interpreter
+newInterpreter = (M.empty, M.empty)
+
+-- Just as with the lexer and parsers above, the evaluator will take advantage of
+-- Applicatives to allow for easy chaining and composition
+data Evaluator a = Evaluator {
+  evaluate :: Tree -> Interpreter -> Either String (Maybe a, Interpreter)
+}
+--
+instance Functor Evaluator where
+  fmap f (Evaluator e) = Evaluator ev
+    where ev tree state = case e tree state of
+                      Left err -> Left err
+                      Right (res, state') -> Right (f <$> res, state')
+
+instance Applicative Evaluator where
+  pure x = Evaluator (\tree interpreter -> Right (Just x, interpreter))
+  (Evaluator e1) <*> (Evaluator e2) = Evaluator e
+    where e tree state = case e1 tree state of
+                      Left err -> Left err
+                      Right (f, state') -> case e2 tree state' of
+                                            Left err -> Left err
+                                            Right (x, state'') -> Right (f <*> x, state'')
+--
+instance Alternative Evaluator where
+  empty = Evaluator (\_ i -> Right (Nothing, i))
+  (Evaluator e1) <|> (Evaluator e2) = Evaluator e
+    where e tree state = case e1 tree state of
+                      Left err -> Left err
+                      Right (f, state') -> case e2 tree state' of
+                                            Left err -> Left err
+                                            Right (x, state'') -> Right (f <|> x, state'')
+
+instance Monad Evaluator where
+    (Evaluator e) >>= f = Evaluator ev
+      where ev tree state = case e tree state of
+                      Left err -> Left err
+                      Right (Nothing, state') -> Right (Nothing, state')
+                      Right (Just res, state') -> evaluate (f res) tree state
+
+evalNum :: Evaluator Double
+evalNum = Evaluator e
+  where e (NumLeaf n) s = Right (Just n, s)
+        e _ s = Right (Nothing, s)
+
+evalIden :: Evaluator Double
+evalIden = Evaluator e
+  where e (IdLeaf i) (varState, funcState) = case M.lookup i varState of
+                              Nothing -> Left $ "ERROR: Unknown identifier '" ++ i ++ "'"
+                              -- Evaluate lazy content stored in table
+                              Just tree -> evaluate eval tree (varState, funcState)
+        e _ s = Right (Nothing, s)
+
+evalAssignment :: Evaluator Double
+evalAssignment = Evaluator e
+  where e (Assign identifier content) state = case (evaluate eval content state) of
                             -- If the content is invalid, the state is unchanged and the user is notified
-                            (Nothing, _) -> (Nothing, state)
+                            Left err -> Left err
                             -- Otherwise, it's possible the content itself modified the state, which we should
                             -- take into account, then modify the state with the content's tree
-                            (res, state') -> (res, (M.insert identifier content state'))
+                            Right (res, (varState, funcState)) -> Right (res, (M.insert identifier content varState, funcState))
+        e _ s = Right (Nothing, s)
 
--- TODO: somehow refactor this so it looks nicer
-eval (BinaryOp Add t1 t2) s = let (res, s') = (eval t1 s) in
-                                let (res', s'') = (eval t2 s') in
-                                  ((+) <$> res <*> res', s'')
+evalBinaryOp :: Evaluator Double
+evalBinaryOp = Evaluator e
+  where e (BinaryOp op t1 t2) state = do
+                        (t1e, state') <- evaluate eval t1 state
+                        (t2e, state'') <- evaluate eval t2 state
+                        case op of
+                          Add -> Right ((+) <$> t1e <*> t2e, state'')
+                          Subtract -> Right ((-) <$> t1e <*> t2e, state'')
+                          Multiply -> Right ((*) <$> t1e <*> t2e, state'')
+                          Divide -> Right ((/) <$> t1e <*> t2e, state'')
+                          Modulo -> Right (mod' <$> t1e <*> t2e, state'')
+                          -- shouldn't ever happen though
+                          _ -> Right (Nothing, state'')
 
-eval (BinaryOp Subtract t1 t2) s = let (res, s') = (eval t1 s) in
-                                let (res', s'') = (eval t2 s') in
-                                  ((-) <$> res <*> res', s'')
+        e _ s = Right (Nothing, s)
 
-eval (BinaryOp Multiply t1 t2) s = let (res, s') = (eval t1 s) in
-                                let (res', s'') = (eval t2 s') in
-                                  ((*) <$> res <*> res', s'')
+eval :: Evaluator Double
+eval = evalNum <|> evalIden <|> evalAssignment <|> evalBinaryOp
 
-eval (BinaryOp Divide t1 t2) s = let (res, s') = (eval t1 s) in
-                                let (res', s'') = (eval t2 s') in
-                                  ((/) <$> res <*> res', s'')
-
-eval (BinaryOp Modulo t1 t2) s = let (res, s') = (eval t1 s) in
-                                let (res', s'') = (eval t2 s') in
-                                  (mod' <$> res <*> res', s'')
-
-eval  _ s= (Nothing, s)
-
-
-interpret :: String -> StateTable -> (Result, StateTable)
-interpret string table = case parseTree of
-    Just (tree, []) -> eval tree table
-    _ -> (Nothing, table)
+input :: String -> Interpreter -> Either String (Result, Interpreter)
+input string interpreter = case parseTree of
+      Just (tree, []) -> evaluate eval tree interpreter
+      _ -> Left "ERROR: Invalid syntax"
   where parseTree = parseFromString string
-
-
---newInterpreter :: Interpreter
---newInterpreter = undefined
---
---input :: String -> Interpreter -> Either String (Result, Interpreter)
---input _ _ = Left "Not implemented"
 
 main :: IO ()
 main = do
-       let st = M.empty
-       loop st
+       -- Initialize with empty state
+       let interpreter = newInterpreter
+       loop interpreter
 
-loop :: StateTable -> IO ()
-loop st = do
-       input <- getLine
-       case (interpret input st) of
-          (Just d, newState) -> do
+prompt :: IO String
+prompt = do
+       putStr "> "
+       hFlush stdout
+       getLine
+
+loop :: Interpreter -> IO ()
+loop currentState = do
+       line <- prompt
+       case (input line currentState) of
+          Right (Just d, newState) -> do
                          putStrLn $ show d
                          loop newState
-          (Nothing, newState) -> do
-                         putStrLn $ "Unable to interpret: " ++ input
-                         loop newState
+          Right (Nothing, _) -> do
+                         putStrLn $ "Unable to interpret: " ++ line
+                         loop currentState
+          Left err -> do
+                      putStrLn err
+                      loop currentState
