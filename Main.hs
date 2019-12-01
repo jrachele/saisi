@@ -8,6 +8,7 @@ import Control.Applicative
 import Data.Char
 import Data.Fixed
 import qualified Data.Map as M
+import Data.List
 import System.IO
 
 
@@ -19,7 +20,7 @@ data Token
     | FnKeyword
     | Parenthesis Char
     | Op Operator
-    deriving (Show, Eq)
+    deriving (Show, Eq, Ord)
 
 data Operator
     = Add
@@ -29,7 +30,7 @@ data Operator
     | Modulo
     | Assignment
     | Function
-    deriving (Show, Eq)
+    deriving (Show, Eq, Ord)
 
 newtype Tokenizer a = Tokenizer {
     tokenize :: String -> Maybe (a, String)
@@ -136,7 +137,7 @@ token = fnKeyword        <|> fnOperator         <|>     number          <|>
         moduloOperator   <|> equalsOperator
 
 tokenizer :: Tokenizer [Token]
-tokenizer = ws *> ((:) <$> token <*> many (ws *> token) <|> pure []) <* ws
+tokenizer = ws *> (some $ ws *> token) <* ws
 
 -- Parser
 -----------------------------------------------
@@ -145,10 +146,10 @@ data Tree
     | IdLeaf String
     | BinaryOp Operator Tree Tree
     | Assign String Tree
-    | FunctionCall String Tree
+    | FunctionCall String [Tree]
     | FunctionDef String [String] Tree
     | Empty
-    deriving (Show)
+    deriving (Show, Ord, Eq)
 
 
 newtype Parser a = Parser {
@@ -206,7 +207,7 @@ term = do
           <|> return f
 
 factor :: Parser Tree
-factor = (paren '(' *> expr <* paren ')') <|> assignment <|> num <|> iden
+factor = (paren '(' *> expr <* paren ')') <|> assignment <|> def <|> call <|> num <|> iden
 
 assignment :: Parser Tree
 assignment = do
@@ -215,6 +216,44 @@ assignment = do
                 e <- expr
                 let (IdLeaf identifier) = i in
                   return (Assign identifier e)
+
+
+-- fn name [args] = expr
+def :: Parser Tree
+def = do
+      function_keyword
+      fn_name <- iden
+      args <- many iden
+      function_operator
+      body <- expr
+      -- We need to unwrap the strings from fn_name and args
+      let fn_name_str = unwrap_id fn_name in
+        let args_str = unwrap_id <$> args in
+          return (FunctionDef fn_name_str args_str body)
+
+
+-- the parser type doesn't matter; it only exists as a small piece in a larger pattern
+function_keyword :: Parser String
+function_keyword = Parser p
+  where p (FnKeyword : ts) = Just ("fn", ts)
+        p _ = Nothing
+
+function_operator :: Parser String
+function_operator = Parser p
+  where p ((Op Function) : ts) = Just ("=>", ts)
+        p _ = Nothing
+
+unwrap_id :: Tree -> String
+unwrap_id (IdLeaf i) = i
+unwrap_id _ = ""
+
+-- constructs explicit function call when non singleton function is called
+call :: Parser Tree
+call = do
+       fn_name <- iden
+       args <- some expr
+       let fn_name_str = unwrap_id fn_name in
+         return (FunctionCall fn_name_str args)
 
 num :: Parser Tree
 num = Parser p
@@ -263,15 +302,17 @@ parseFromString s = do
 
 -- M = Data.Map
 type VarTable = M.Map String Tree
--- Maybe store a function instead of [String] ?
+-- For the argument -> function relationship, we pair String -> ([String], Tree), which is
+-- Function Name -> ([Argument Identifiers], Function Body)
 type FuncTable = M.Map String ([String], Tree)
 type Result = Maybe Double
 
--- For the sake of the kata, interpreter will be just two Maps
-type Interpreter = (VarTable, FuncTable)
+data EvaluationMode = Var | Func String [Tree] deriving (Show)
+-- The interpreter consists of
+type Interpreter = (EvaluationMode, VarTable, FuncTable)
 
 newInterpreter :: Interpreter
-newInterpreter = (M.empty, M.empty)
+newInterpreter = (Var, M.empty, M.empty)
 
 -- Just as with the lexer and parsers above, the evaluator will take advantage of
 -- Applicatives to allow for easy chaining and composition
@@ -308,7 +349,7 @@ instance Monad Evaluator where
       where ev tree state = case e tree state of
                       Left err -> Left err
                       Right (Nothing, state') -> Right (Nothing, state')
-                      Right (Just res, state') -> evaluate (f res) tree state
+                      Right (Just res, state') -> evaluate (f res) tree state'
 
 evalNum :: Evaluator Double
 evalNum = Evaluator e
@@ -317,10 +358,22 @@ evalNum = Evaluator e
 
 evalIden :: Evaluator Double
 evalIden = Evaluator e
-  where e (IdLeaf i) (varState, funcState) = case M.lookup i varState of
-                              Nothing -> Left $ "ERROR: Unknown identifier '" ++ i ++ "'"
-                              -- Evaluate lazy content stored in table
-                              Just tree -> evaluate eval tree (varState, funcState)
+  where e (IdLeaf i) (mode, varState, funcState) = case mode of
+             -- Var is the mode for regular identifiers and also singleton function calls
+             -- which semantically are the same as regular identifiers
+             Var -> case M.lookup i varState of
+                       -- If the identifier is valid then recursively evaluate the tree associated with it
+                       Just tree -> evaluate eval tree (Var, varState, funcState)
+                       Nothing -> case M.lookup i funcState of
+                           Nothing -> Left $ "ERROR: Unknown identifier: '" ++ i ++ "'"
+                           -- This is a singleton function call
+                           Just (_, tree) -> evaluate evalFunction tree (Func i [], varState, funcState)
+             Func fn_name args -> case M.lookup fn_name funcState of
+                       Nothing -> Left $ "ERROR: Invalid function call: '" ++ i ++ "'"
+                       Just (identifiers, tree) -> case find (\(x, _) -> x==i) $ zip identifiers args of
+                            Nothing -> Left $ "ERROR: Unknown identifier '" ++ i ++ "' in function '" ++ fn_name ++ "'"
+                            Just (_, arg_tree) -> evaluate eval arg_tree (Var, varState, funcState)
+
         e _ s = Right (Nothing, s)
 
 evalAssignment :: Evaluator Double
@@ -330,7 +383,7 @@ evalAssignment = Evaluator e
                             Left err -> Left err
                             -- Otherwise, it's possible the content itself modified the state, which we should
                             -- take into account, then modify the state with the content's tree
-                            Right (res, (varState, funcState)) -> Right (res, (M.insert identifier content varState, funcState))
+                            Right (res, (mode, varState, funcState)) -> Right (res, (mode, M.insert identifier content varState, funcState))
         e _ s = Right (Nothing, s)
 
 evalBinaryOp :: Evaluator Double
@@ -349,8 +402,29 @@ evalBinaryOp = Evaluator e
 
         e _ s = Right (Nothing, s)
 
+evalFunctionDef :: Evaluator Double
+evalFunctionDef = Evaluator e
+  where e (FunctionDef fn_name args body) (mode, varState, funcState) =
+          Right (Nothing, (mode, varState, (M.insert fn_name (args, body) funcState)))
+        e _ s = Right (Nothing, s)
+
+evalFunction :: Evaluator Double
+evalFunction = Evaluator e
+  where e (FunctionCall fn_name args) (_, varState, funcState) =
+          -- Use the variable state to evaluate the arguments, then
+          -- replace all instances of arguments in the func state with the evaluated args, and
+          -- evaluate normally
+          case (M.lookup fn_name funcState) of
+            Nothing -> Left $ "ERROR: Undefined function: '" ++ fn_name ++ "'"
+            Just (identifiers, tree) -> if length args /= length identifiers
+                                    then Left "ERROR: Mismatched number of arguments"
+                                    else evaluate eval tree (Func fn_name args, varState, funcState)
+
+        e _ s = Right (Nothing, s)
+
+
 eval :: Evaluator Double
-eval = evalNum <|> evalIden <|> evalAssignment <|> evalBinaryOp
+eval = evalNum <|> evalIden <|> evalAssignment <|> evalBinaryOp <|> evalFunctionDef <|> evalFunction
 
 input :: String -> Interpreter -> Either String (Result, Interpreter)
 input string interpreter = case parseTree of
@@ -375,11 +449,12 @@ loop currentState = do
        line <- prompt
        case (input line currentState) of
           Right (Just d, newState) -> do
-                         putStrLn $ show d
+                         putStrLn $ "DEBUG: " ++ show d ++ " ; STATE: " ++ show newState
                          loop newState
-          Right (Nothing, _) -> do
-                         putStrLn $ "Unable to interpret: " ++ line
-                         loop currentState
+          Right (Nothing, newState) -> do
+                         putStrLn $ "STATE: " ++ show newState
+--                         putStrLn $ "Unable to interpret: " ++ line
+                         loop newState
           Left err -> do
                       putStrLn err
                       loop currentState
