@@ -192,6 +192,7 @@ module Main where
     -- num :: Number
     -- iden :: Identifier
     
+
     expr :: Parser Tree
     expr = do
            t <- term
@@ -220,73 +221,6 @@ module Main where
                     let (IdLeaf identifier) = i in
                       return (Assign identifier e)
     
-    
-    -- fn name [args] = expr
-    def :: Parser Tree
-    def = do
-          function_keyword
-          fn_name <- iden
-          args <- many iden
-          function_operator
-          body <- expr
-          -- We need to unwrap the strings from fn_name and args
-          let fn_name_str = unwrap_id fn_name in
-            let args_str = unwrap_id <$> args in
-              return (FunctionDef fn_name_str args_str body)
-    
-    
-    -- the parser type doesn't matter; it only exists as a small piece in a larger pattern
-    function_keyword :: Parser String
-    function_keyword = Parser p
-      where p (FnKeyword : ts) _ = Just ("fn", ts)
-            p _ _ = Nothing
-    
-    function_operator :: Parser String
-    function_operator = Parser p
-      where p ((Op Function) : ts) _ = Just ("=>", ts)
-            p _ _ = Nothing
-    
-    unwrap_id :: Tree -> String
-    unwrap_id (IdLeaf i) = i
-    unwrap_id _ = ""
-    
-    -- constructs explicit function call when non singleton function is called
-    call :: Parser Tree
-    call = Parser p
-      where
-        p tokens interpreter = parse fn_call tokens interpreter
-          where
-            fn_call = do
-              fn_name <- fn_iden
-              case num_args (unwrap_id fn_name) interpreter of
-                Just argc -> do
-                  args <- sequenceA $ replicate argc expr
-                  let fn_name_str = unwrap_id fn_name
-                   in return (FunctionCall fn_name_str args)
-    
-    num :: Parser Tree
-    num = Parser p
-      where p ((Number n) : ts) _ = Just ((NumLeaf n), ts)
-            p _ _ = Nothing
-    
-    iden :: Parser Tree
-    iden = Parser p
-      where p ((Identifier i) : ts) _ = Just ((IdLeaf i), ts)
-            p _ _ = Nothing
-    
-    fn_iden :: Parser Tree
-    fn_iden = Parser p
-      where p ((Identifier i) : ts) interpreter = case (M.lookup i interpreter) of
-                                                  Just (_, Func, _) -> Just ((IdLeaf i), ts)
-                                                  _ -> Nothing
-            p _ _ = Nothing
-    
-    num_args :: String -> Interpreter -> Maybe Int
-    num_args i interpreter =
-      case M.lookup i interpreter of
-        Just (args, Func, _) -> Just $ length args
-        _                    -> Nothing
-
     additive_operator :: Parser Operator
     additive_operator = Parser p
       where p ((Op o): ts) _ = case o of
@@ -309,6 +243,81 @@ module Main where
       where p ((Op Assignment): ts) _ = Just (Assignment, ts)
             p _ _ = Nothing
     
+    -- fn name [args] = expr
+    def :: Parser Tree
+    def = do
+          function_keyword
+          fn_name <- iden
+          args <- many iden
+          function_operator
+          body <- expr
+          -- We need to unwrap the strings from fn_name and args
+          let fn_name_str = unwrap_id fn_name in
+            let args_str = unwrap_id <$> args in
+              return (FunctionDef fn_name_str args_str body)
+    
+    
+    -- constructs explicit function call when non singleton function is called
+    call :: Parser Tree
+    call = Parser p
+      where
+        p tokens interpreter = parse fn_call tokens interpreter
+          where
+            fn_call = do
+              fn_name <- fn_iden
+              case num_args (unwrap_id fn_name) interpreter of
+                Just argc -> do
+                  args <- sequenceA $ replicate argc expr
+                  let fn_name_str = unwrap_id fn_name
+                   in return (FunctionCall fn_name_str args)
+
+    num :: Parser Tree
+    num = Parser p
+      where p ((Number n) : ts) _ = Just ((NumLeaf n), ts)
+            p _ _ = Nothing
+    
+    iden :: Parser Tree
+    iden = Parser p
+      where p ((Identifier i) : ts) _ = Just ((IdLeaf i), ts)
+            p _ _ = Nothing
+    
+    fn_iden :: Parser Tree
+    fn_iden = Parser p
+      where p ((Identifier i) : ts) interpreter = case (M.lookup i interpreter) of
+                                                  Just (_, Func, _) -> Just ((IdLeaf i), ts)
+                                                  _ -> Nothing
+            p _ _ = Nothing
+
+
+    -- the parser type doesn't matter; it only exists as a small piece in a larger pattern
+    function_keyword :: Parser String
+    function_keyword = Parser p
+      where p (FnKeyword : ts) _ = Just ("fn", ts)
+            p _ _ = Nothing
+    
+    function_operator :: Parser String
+    function_operator = Parser p
+      where p ((Op Function) : ts) _ = Just ("=>", ts)
+            p _ _ = Nothing
+    
+    unwrap_id :: Tree -> String
+    unwrap_id (IdLeaf i) = i
+    unwrap_id _ = ""
+
+    wrap_id :: String -> Tree
+    wrap_id i = (IdLeaf i)
+
+    -- validate_fn_tree :: Tree -> Tree -> Bool
+    -- validate_fn_tree node (BinaryOp _ t1 t2) = (validate_fn_tree node t1) || (validate_fn_tree node t2)
+    -- validate_fn_tree node (Assign _ tree) = validate_fn_tree node tree
+    -- validate_fn_tree node tree = node == tree
+    
+    num_args :: String -> Interpreter -> Maybe Int
+    num_args i interpreter =
+      case M.lookup i interpreter of
+        Just (args, Func, _) -> Just $ length args
+        _                    -> Nothing
+
     paren :: Char -> Parser Char
     paren c = Parser p
       where p ((Parenthesis x) : ts) _ = if c==x then Just (x, ts) else Nothing
@@ -418,11 +427,15 @@ module Main where
     evalFunctionDef :: Evaluator Double
     evalFunctionDef = Evaluator e
       where e (FunctionDef fn_name args body) state =
-              -- run the function to see if it returns an error or not
-              let run_args = replicate (length args) (NumLeaf 0) in 
-                case (evaluate evalFunction (FunctionCall fn_name run_args) (M.insert fn_name (args, Func, body) state)) of
-                    Left err -> Left err
-                    Right _ -> Right (Nothing, M.insert fn_name (args, Func, body) state)
+              -- firstly, we have to check that the function is not shadowing a variable
+              case (M.lookup fn_name state) of
+                Just (_, Val, _) -> Left $ "ERROR: Identifier already declared: '" ++ fn_name ++ "'"
+                _ -> 
+                    -- run the function to see if it returns an error or not
+                    let run_args = replicate (length args) (NumLeaf 0) in 
+                      case (evaluate evalFunction (FunctionCall fn_name run_args) (M.insert fn_name (args, Func, body) state)) of
+                          Left err -> Left err
+                          Right _ -> Right (Nothing, M.insert fn_name (args, Func, body) state)
             e _ s = Right (Nothing, s)
     
     evalFunction :: Evaluator Double
@@ -459,10 +472,14 @@ module Main where
     eval = evalNum <|> evalFunction <|> evalIden <|> evalAssignment <|> evalBinaryOp <|> evalFunctionDef
     
     input :: String -> Interpreter -> Either String (Result, Interpreter)
-    input string interpreter = case parseTree of
-          Just (tree, []) -> evaluate eval tree interpreter
-          _ -> Left "ERROR: Invalid syntax"
-      where parseTree = parseFromString string interpreter
+    input string interpreter = case (all isSpace string) of
+        True -> Right (Nothing, interpreter)
+        False -> 
+                case parseTree of
+                    Just (tree, []) -> evaluate eval tree interpreter
+                    _ -> Left "ERROR: Invalid syntax"
+                where parseTree = parseFromString string interpreter
+      
     
     main :: IO ()
     main = do
