@@ -5,6 +5,7 @@ module Main where
 -- For his Haskell JSON parser from which my Tokenizer was inspired
 
 import Control.Applicative
+import Control.Monad
 import Data.Char
 import Data.Fixed
 import Data.Either
@@ -153,35 +154,36 @@ data Tree
     deriving (Show, Ord, Eq)
 
 
+-- Our parser is context dependent, solely to analyze function calls
 newtype Parser a = Parser {
-    parse :: [Token] -> Maybe (a, [Token])
+    parse :: [Token] -> Interpreter -> Maybe (a, [Token])
 }
 
 instance Functor Parser where
     fmap f (Parser p) = Parser b
-      where b input = do
-                (t, rest) <- p input
+      where b input interpreter = do
+                (t, rest) <- p input interpreter
                 Just (f t, rest)
 
 instance Applicative Parser where
-    pure x = Parser (\i -> Just (x, i))
+    pure x = Parser (\i _ -> Just (x, i))
     (Parser p1) <*> (Parser p2) = Parser b
-      where b input = do
-                (func, rest) <- p1 input
-                (e, rest') <- p2 rest
+      where b input interpreter = do
+                (func, rest) <- p1 input interpreter
+                (e, rest') <- p2 rest interpreter
                 Just (func e, rest')
 
 instance Alternative Parser where
-    empty = Parser (const Nothing)
+    empty = Parser (\_ _ -> Nothing)
     (Parser p1) <|> (Parser p2) = Parser b
-      where b input = do
-                (p1 input) <|> (p2 input)
+      where b input interpreter= do
+                (p1 input interpreter) <|> (p2 input interpreter)
 
 instance Monad Parser where
     (Parser p) >>= f = Parser b
-      where b input = case p input of
+      where b input interpreter = case p input interpreter of
                       Nothing -> Nothing
-                      Just (x, r) -> parse (f x) r
+                      Just (x, r) -> parse (f x) r interpreter
 
 -- GRAMMAR:
 -- expr ::- term (+- expr)
@@ -208,7 +210,8 @@ term = do
           <|> return f
 
 factor :: Parser Tree
-factor = (paren '(' *> expr <* paren ')') <|> num <|> iden <|> assignment <|> def <|> call
+-- factor = num <|> iden <|> assignment <|> (paren '(' *> expr <* paren ')') <|> assignment <|> def <|> call 
+factor = (paren '(' *> expr <* paren ')') <|> assignment <|> def <|> call <|> iden <|> num 
 
 assignment :: Parser Tree
 assignment = do
@@ -236,13 +239,13 @@ def = do
 -- the parser type doesn't matter; it only exists as a small piece in a larger pattern
 function_keyword :: Parser String
 function_keyword = Parser p
-  where p (FnKeyword : ts) = Just ("fn", ts)
-        p _ = Nothing
+  where p (FnKeyword : ts) _ = Just ("fn", ts)
+        p _ _ = Nothing
 
 function_operator :: Parser String
 function_operator = Parser p
-  where p ((Op Function) : ts) = Just ("=>", ts)
-        p _ = Nothing
+  where p ((Op Function) : ts) _ = Just ("=>", ts)
+        p _ _ = Nothing
 
 unwrap_id :: Tree -> String
 unwrap_id (IdLeaf i) = i
@@ -251,59 +254,67 @@ unwrap_id _ = ""
 -- constructs explicit function call when non singleton function is called
 call :: Parser Tree
 call = do
-       fn_name <- iden
+       fn_name <- fn_iden
        args <- some expr
        let fn_name_str = unwrap_id fn_name in
          return (FunctionCall fn_name_str args)
 
 num :: Parser Tree
 num = Parser p
-  where p ((Number n) : ts) = Just ((NumLeaf n), ts)
-        p _ = Nothing
+  where p ((Number n) : ts) _ = Just ((NumLeaf n), ts)
+        p _ _ = Nothing
 
 iden :: Parser Tree
 iden = Parser p
-  where p ((Identifier i) : ts) = Just ((IdLeaf i), ts)
-        p _ = Nothing
+  where p ((Identifier i) : ts) _ = Just ((IdLeaf i), ts)
+        p _ _ = Nothing
+
+fn_iden :: Parser Tree
+fn_iden = Parser p
+  where p ((Identifier i) : ts) interpreter = case (M.lookup i interpreter) of
+                                              Just (_, Func, _) -> Just ((IdLeaf i), ts)
+                                              _ -> Nothing
+        p _ _ = Nothing
 
 additive_operator :: Parser Operator
 additive_operator = Parser p
-  where p ((Op o): ts) = case o of
+  where p ((Op o): ts) _ = case o of
             Add -> Just (o, ts)
             Subtract -> Just (o, ts)
             _ -> Nothing
-        p _ = Nothing
+        p _ _ = Nothing
 
 multiplicative_operator :: Parser Operator
 multiplicative_operator = Parser p
-  where p ((Op o): ts) = case o of
+  where p ((Op o): ts) _ = case o of
             Multiply -> Just (o, ts)
             Divide -> Just (o, ts)
             Modulo -> Just (o, ts)
             _ -> Nothing
-        p _ = Nothing
+        p _ _ = Nothing
 
 assignment_operator :: Parser Operator
 assignment_operator = Parser p
-  where p ((Op Assignment): ts) = Just (Assignment, ts)
-        p _ = Nothing
+  where p ((Op Assignment): ts) _ = Just (Assignment, ts)
+        p _ _ = Nothing
 
 paren :: Char -> Parser Char
 paren c = Parser p
-  where p ((Parenthesis x) : ts) = if c==x then Just (x, ts) else Nothing
-        p _ = Nothing
+  where p ((Parenthesis x) : ts) _ = if c==x then Just (x, ts) else Nothing
+        p _ _ = Nothing
 
-parseFromString :: String -> Maybe (Tree, [Token])
-parseFromString s = do
+parseFromString :: String -> Interpreter -> Maybe (Tree, [Token])
+parseFromString s interpreter = do
                     (tokens, []) <- tokenize tokenizer s
-                    parse expr tokens
+                    parse expr tokens interpreter
 
 -- Interpreter
 -------------------------------------
 
 -- M = Data.Map
 -- Interpreter maps ID -> ([ARGS], CONTENT), where ARGS is optional and only used for functions
-type Interpreter = M.Map String ([String], Tree)
+type Interpreter = M.Map String ([String], VarType, Tree)
+data VarType = Val | Func deriving (Show)
 
 type Result = Maybe Double
 
@@ -357,9 +368,11 @@ evalIden = Evaluator e
 -- TODO add types to global state table
   where e (IdLeaf i) state = case M.lookup i state of
                        -- If the identifier is valid then recursively evaluate the tree associated with it
-                       Just ([], tree) -> evaluate eval tree state
-                       Just (_, tree) -> Left $ "ERROR: Too few arguments for function call: '" ++ i ++ "'"
-                       Nothing -> Left $ "ERROR: Unknown identifier: '" ++ i ++ "'"
+                       Just ([], Val, tree) -> evaluate eval tree state
+                       -- Singleton function call
+                       Just (_, Func, tree) -> evaluate evalFunction (FunctionCall i []) state
+                      --  Just (_, tree) -> Left $ "ERROR: Too few arguments for function call: '" ++ i ++ "'"
+                       _ -> Left $ "ERROR: Unknown identifier: '" ++ i ++ "'"
         e _ s = Right (Nothing, s)
 
 evalAssignment :: Evaluator Double
@@ -369,7 +382,10 @@ evalAssignment = Evaluator e
                             Left err -> Left err
                             -- Otherwise, it's possible the content itself modified the state, which we should
                             -- take into account, then modify the state with the content's tree
-                            Right (res, state) -> Right (res, (M.insert identifier ([], content) state))
+                            Right (res, state) -> case M.lookup identifier state of
+                                  -- you cannot declare a variable with the same name as a function
+                                  Just (_, Func, _) -> Left $ "ERROR: Function already defined for identifier: '" ++ identifier ++ "'"
+                                  _ -> Right (res, (M.insert identifier ([], Val, content) state))
         e _ s = Right (Nothing, s)
 
 evalBinaryOp :: Evaluator Double
@@ -391,7 +407,7 @@ evalBinaryOp = Evaluator e
 evalFunctionDef :: Evaluator Double
 evalFunctionDef = Evaluator e
   where e (FunctionDef fn_name args body) state =
-          Right (Nothing, M.insert fn_name (args, body) state)
+          Right (Nothing, M.insert fn_name (args, Func, body) state)
         e _ s = Right (Nothing, s)
 
 evalFunction :: Evaluator Double
@@ -402,7 +418,7 @@ evalFunction = Evaluator e
           -- evaluate normally
           case (M.lookup fn_name state) of
             Nothing -> Left $ "ERROR: Undefined function: '" ++ fn_name ++ "'"
-            Just (identifiers, tree) ->
+            Just (identifiers, _, tree) ->
                                     if length args /= length identifiers
                                     then Left $ "ERROR: Mismatched number of arguments: ARGS: " ++ show args ++ "; IDENTIFIERS: " ++ show identifiers
                                     else
@@ -413,7 +429,7 @@ evalFunction = Evaluator e
                                           Just err -> err
                                           -- get the pure results from the argument list after evaluation
                                           Nothing -> let validated_args = (\(Right (Just x, _)) -> NumLeaf x) <$> evaluated_args in
-                                              let funcState = foldr (\(a, b) acc -> M.insert a ([], b) acc) M.empty (zip identifiers validated_args) in
+                                              let funcState = foldr (\(a, b) acc -> M.insert a ([], Val, b) acc) M.empty (zip identifiers validated_args) in
                                                 case evaluate eval tree funcState of
                                                   -- Preserve the state since the function will not modify global state
                                                   Right (res, _) -> Right (res, state)
@@ -431,7 +447,7 @@ input :: String -> Interpreter -> Either String (Result, Interpreter)
 input string interpreter = case parseTree of
       Just (tree, []) -> evaluate eval tree interpreter
       _ -> Left "ERROR: Invalid syntax"
-  where parseTree = parseFromString string
+  where parseTree = parseFromString string interpreter
 
 main :: IO ()
 main = do
