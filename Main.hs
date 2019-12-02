@@ -5,7 +5,6 @@ module Main where
     -- For his Haskell JSON parser from which my Tokenizer was inspired
     
     import Control.Applicative
-    import Control.Monad
     import Data.Char
     import Data.Fixed
     import Data.Either
@@ -419,7 +418,11 @@ module Main where
     evalFunctionDef :: Evaluator Double
     evalFunctionDef = Evaluator e
       where e (FunctionDef fn_name args body) state =
-              Right (Nothing, M.insert fn_name (args, Func, body) state)
+              -- run the function to see if it returns an error or not
+              let run_args = replicate (length args) (NumLeaf 0) in 
+                case (evaluate evalFunction (FunctionCall fn_name run_args) (M.insert fn_name (args, Func, body) state)) of
+                    Left err -> Left err
+                    Right _ -> Right (Nothing, M.insert fn_name (args, Func, body) state)
             e _ s = Right (Nothing, s)
     
     evalFunction :: Evaluator Double
