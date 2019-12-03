@@ -146,6 +146,7 @@ module Main where
         = NumLeaf Double
         | IdLeaf String
         | BinaryOp Operator Tree Tree
+        | PartialOp Operator Tree
         | Assign String Tree
         | FunctionCall String [Tree]
         | FunctionDef String [String] Tree
@@ -191,24 +192,28 @@ module Main where
     -- assignment :: identifier = expr
     -- num :: Number
     -- iden :: Identifier
+
+    -- expr ::- expr +- expr | term
+
+
     
 
     expr :: Parser Tree
     expr = do
            t <- term
-           do o <- additive_operator
-              e <- expr
-              return (BinaryOp o t e)
-              <|> return t
+           rest t
+           where rest a = (do o <- additive_operator 
+                              e <- term
+                              rest (BinaryOp o a e)) <|> pure a
     
     term :: Parser Tree
     term = do
            f <- factor
-           do o <- multiplicative_operator
-              t <- term
-              return (BinaryOp o f t)
-              <|> return f
-    
+           rest f
+           where rest a = (do o <- multiplicative_operator
+                              e <- factor
+                              rest (BinaryOp o a e)) <|> pure a
+
     factor :: Parser Tree
     -- factor = num <|> iden <|> assignment <|> (paren '(' *> expr <* paren ')') <|> assignment <|> def <|> call 
     factor = (paren '(' *> expr <* paren ')') <|> assignment <|> def <|> call <|> iden <|> num 
@@ -221,6 +226,7 @@ module Main where
                     let (IdLeaf identifier) = i in
                       return (Assign identifier e)
     
+
     additive_operator :: Parser Operator
     additive_operator = Parser p
       where p ((Op o): ts) _ = case o of
